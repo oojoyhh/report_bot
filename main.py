@@ -15,6 +15,8 @@ GitHub Actions 등 일반 인터넷 접속이 가능한 환경에서 실행하�
 import os
 import re
 import sys
+import json
+import html
 import datetime
 from urllib.parse import urljoin
 
@@ -101,17 +103,27 @@ def parse_research_table(html_text: str, base_url: str):
 
             # 제목 링크 찾기
             title_tag = None
+            read_type = None
             for a in tr.find_all("a"):
                 href = a.get("href", "")
-                if READ_LINK_RE.search(href):
+                m = READ_LINK_RE.search(href)
+                if m:
                     title_tag = a
+                    read_type = m.group(1)
                     break
             if title_tag is None:
                 continue
             title = title_tag.get_text(strip=True)
             if not title:
                 continue
-            link = urljoin(base_url, title_tag.get("href", ""))
+
+            # 링크 조립: 네이버가 상대경로/절대경로를 페이지마다 다르게 내려줘서
+            # urljoin에 의존하지 않고 "/research/<read_type>.naver?<query>" 형태로 직접 만든다.
+            raw_href = title_tag.get("href", "")
+            query = raw_href.split("?", 1)[1] if "?" in raw_href else ""
+            link = f"{NAVER_BASE}/research/{read_type}.naver"
+            if query:
+                link += f"?{query}"
 
             # 날짜 찾기
             row_text = tr.get_text(" ", strip=True)
@@ -126,9 +138,15 @@ def parse_research_table(html_text: str, base_url: str):
                     pdf_link = urljoin(base_url, href)
                     break
 
-            # 증권사(작성기관) 추정: 제목/날짜가 아닌 td 텍스트 중 첫번째
+            # 증권사(작성기관) 추정: 제목이 들어있는 td '이후'의 td들 중
+            # 비어있지 않고 날짜/제목이 아닌 첫 텍스트 (제목 이전 td는 종목명 컬럼일 수 있어 제외)
             org = ""
-            for td in tds:
+            title_td = title_tag.find_parent("td")
+            try:
+                title_idx = tds.index(title_td)
+            except ValueError:
+                title_idx = -1
+            for td in tds[title_idx + 1:]:
                 txt = td.get_text(strip=True)
                 if not txt or txt == title or DATE_RE.fullmatch(txt):
                     continue
@@ -211,8 +229,20 @@ def fetch_industry_reports():
     return [], "none"
 
 
+def _strip_code_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"```$", "", text).strip()
+    return text
+
+
 def summarize_with_claude(hynix_reports, industry_reports):
-    """ANTHROPIC_API_KEY가 있으면 제목들을 재료로 쉬운 설명을 생성. 실패하면 None."""
+    """
+    ANTHROPIC_API_KEY가 있으면 리포트 제목들을 재료로
+    { "overview": "...", "highlights": [{"title","detail"}, ...] } 형태의 JSON을 생성.
+    키가 없거나 실패하면 None.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -222,40 +252,70 @@ def summarize_with_claude(hynix_reports, industry_reports):
         print("[WARN] anthropic 패키지가 설치되어 있지 않아 요약을 건너뜁니다.", file=sys.stderr)
         return None
 
-    titles = [r["title"] for r in hynix_reports + industry_reports]
-    if not titles:
+    all_reports = hynix_reports + industry_reports
+    if not all_reports:
         return None
+
+    listing = "\n".join(f"- {r['title']} ({r['org']})" for r in all_reports)
 
     prompt = (
         "너는 SK그룹(특히 SK하이닉스, SK AX) 취업/이직/면접을 준비하는 사람에게 "
         "매일 아침 산업 동향을 쉽게 설명해주는 코치야.\n"
-        "아래는 오늘 나온 반도체·메모리 및 IT서비스·AI 관련 증권사/산업 리포트 제목 목록이야.\n\n"
-        + "\n".join(f"- {t}" for t in titles)
-        + "\n\n이 제목들만 보고 오늘의 핵심 흐름을 취준생이 이해하기 쉽게 3~4문장으로 설명해줘. "
-        "전문용어는 풀어서 설명하고, 면접에서 언급하면 좋을 포인트가 있으면 마지막에 한 줄 덧붙여줘."
+        "아래는 오늘 나온 반도체·메모리 및 IT서비스·AI 관련 증권사/산업 리포트 제목 목록이야 (제목 (증권사) 형태).\n\n"
+        + listing
+        + "\n\n아래 JSON 형식으로만 응답해. 다른 설명이나 마크다운 코드블록 없이 JSON 객체 하나만 출력해:\n"
+        '{\n'
+        '  "overview": "오늘 전체 흐름을 취준생이 이해하기 쉽게 2~3문장으로 (전문용어는 풀어서 설명)",\n'
+        '  "highlights": [\n'
+        '    {"title": "위 목록에 있는 제목을 정확히 그대로 복사", "detail": "이 리포트가 다룰 핵심 내용과 왜 중요한지, 면접에서 언급하면 좋을 포인트를 포함해 2~3문장"}\n'
+        "  ]\n"
+        "}\n"
+        "highlights는 가장 중요해 보이는 순서로 최대 3개만. "
+        "텍스트에 마크다운 문법(**, #, - 등)은 절대 쓰지 말고 순수 텍스트로만 작성해."
     )
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=500,
+            max_tokens=800,
             messages=[{"role": "user", "content": prompt}],
         )
-        return message.content[0].text.strip()
+        raw = _strip_code_fence(message.content[0].text)
+        data = json.loads(raw)
+
+        # highlight title -> link 매칭
+        link_by_title = {r["title"]: r["link"] for r in all_reports}
+        highlights = []
+        for h in data.get("highlights", [])[:3]:
+            title = h.get("title", "").strip()
+            detail = h.get("detail", "").strip()
+            if not title or not detail:
+                continue
+            highlights.append({
+                "title": title,
+                "detail": detail,
+                "link": link_by_title.get(title),
+            })
+
+        return {
+            "overview": data.get("overview", "").strip() or None,
+            "highlights": highlights,
+        }
     except Exception as e:
         print(f"[WARN] Claude 요약 생성 실패: {e}", file=sys.stderr)
         return None
 
 
 def _section(title_line, reports, tier):
+    """리포트 목록을 링크만 있는 간단한 형태로 렌더링."""
     lines = [title_line]
     note = FALLBACK_NOTES.get(tier)
     if note:
-        lines.append(note)
+        lines.append(html.escape(note))
     if reports:
         for r in reports:
-            lines.append(f'• <a href="{r["link"]}">{r["title"]}</a> — {r["org"]} ({r["date"]})')
+            lines.append(f'• <a href="{html.escape(r["link"], quote=True)}">{html.escape(r["title"])}</a>')
     else:
         lines.append("· 가져온 리포트 없음 (사이트 구조 변경 등으로 파싱 실패 가능성)")
     return lines
@@ -266,9 +326,10 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
     lines = [f"<b>📊 SK 산업동향 브리핑 ({today})</b>", ""]
 
     summary = summarize_with_claude(hynix_reports, industry_reports)
-    if summary:
+
+    if summary and summary.get("overview"):
         lines.append("<b>🗣 오늘의 요약</b>")
-        lines.append(summary)
+        lines.append(html.escape(summary["overview"]))
         lines.append("")
 
     lines += _section(f"<b>🔧 SK하이닉스 관련 리포트 ({len(hynix_reports)}건)</b>", hynix_reports, hynix_tier)
@@ -278,6 +339,22 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
         industry_reports,
         industry_tier,
     )
+
+    if summary and summary.get("highlights"):
+        lines.append("")
+        lines.append("<b>🔎 오늘의 핵심 리포트</b>")
+        for h in summary["highlights"]:
+            title_escaped = html.escape(h["title"])
+            if h.get("link"):
+                title_html = f'<a href="{html.escape(h["link"], quote=True)}"><b>{title_escaped}</b></a>'
+            else:
+                title_html = f"<b>{title_escaped}</b>"
+            lines.append(title_html)
+            lines.append(html.escape(h["detail"]))
+            lines.append("")
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
+        lines.append("")
+        lines.append("※ ANTHROPIC_API_KEY를 등록하면 핵심 리포트 3개를 더 자세히 풀어서 보내드려요.")
 
     lines.append("")
     lines.append("출근길 화이팅! 🚇")

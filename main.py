@@ -165,7 +165,7 @@ def fetch_hynix_reports():
     except Exception as e:
         print(f"[WARN] SK하이닉스 리포트 조회 실패: {e}", file=sys.stderr)
         return [], "none"
-    reports = parse_research_table(html_text, NAVER_BASE)
+    reports = parse_research_table(html_text, url)
 
     tier1 = [r for r in reports if is_recent(r["date"])]
     if tier1:
@@ -187,7 +187,7 @@ def fetch_industry_reports():
     except Exception as e:
         print(f"[WARN] 산업분석 리포트 조회 실패: {e}", file=sys.stderr)
         return [], "none"
-    reports = parse_research_table(html_text, NAVER_BASE)
+    reports = parse_research_table(html_text, url)
     keyword_matched = [r for r in reports if any(kw in r["title"] for kw in INDUSTRY_KEYWORDS)]
 
     tier1 = [r for r in keyword_matched if is_recent(r["date"])]

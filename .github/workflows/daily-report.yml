@@ -2,8 +2,13 @@ name: Daily SK Report
 
 on:
   schedule:
-    - cron: "0 22 * * *"
+    # 21:37 UTC = 06:37 KST (매일). 정각(0분)은 전 세계적으로 스케줄이 몰려
+    # GitHub 큐에서 밀리기 쉬워서, 애매한 분+여유시간으로 지연에 대비한다.
+    - cron: "37 21 * * *"
   workflow_dispatch: {}
+
+permissions:
+  contents: write  # 아래 "중복 방지 상태 저장" 단계에서 state 파일을 커밋/푸시하기 위해 필요
 
 jobs:
   send-report:
@@ -26,3 +31,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python main.py
+
+      - name: 중복 방지 상태 저장
+        run: |
+          git config user.name "sk-report-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/sent_titles.json
+          git diff --cached --quiet || git commit -m "chore: update sent report state [skip ci]"
+          git push

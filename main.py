@@ -65,11 +65,24 @@ def parse_date(date_str: str):
         return None
 
 
+KST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def kst_today() -> datetime.date:
+    """
+    GitHub Actions 서버 시스템 시간은 UTC라서 datetime.date.today()를 그냥 쓰면
+    KST 기준 아침 시간대(00:00~08:59 KST)에는 하루 전 날짜가 나온다.
+    (예: 07:00 KST = 22:00 UTC 전날 → date.today()가 전날을 반환)
+    항상 KST 기준 오늘 날짜를 명시적으로 계산한다.
+    """
+    return datetime.datetime.now(KST).date()
+
+
 def is_recent(date_str: str, days: int = LOOKBACK_DAYS) -> bool:
     d = parse_date(date_str)
     if d is None:
         return False
-    return (datetime.date.today() - d).days <= days
+    return (kst_today() - d).days <= days
 
 
 DATE_RE = re.compile(r"\d{2}\.\d{2}\.\d{2}")
@@ -455,7 +468,7 @@ def _report_links(title_line, reports, tier):
 
 
 def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
-    today = datetime.date.today().strftime("%Y.%m.%d")
+    today = kst_today().strftime("%Y.%m.%d")
     lines = [f"<b>📊 SK 산업동향 브리핑 ({today})</b>"]
 
     summary = summarize_with_claude(hynix_reports, industry_reports)

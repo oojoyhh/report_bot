@@ -18,7 +18,7 @@ import sys
 import json
 import html
 import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -77,6 +77,24 @@ DATE_RE = re.compile(r"\d{2}\.\d{2}\.\d{2}")
 READ_LINK_RE = re.compile(r"(company_read|industry_read|market_read|debenture_read)\.naver")
 
 
+def normalize_research_link(raw_href: str):
+    """
+    네이버 리서치 상세 링크를 항상 /research/... 주소로 정규화한다.
+
+    목록 페이지의 href는 ``company_read.naver?...`` 같은 상대경로인데,
+    이를 네이버 도메인 루트에 바로 붙이면 존재하지 않는
+    ``/company_read.naver`` 주소가 된다. 상대/절대경로 여부와 관계없이
+    실제 상세 페이지가 있는 ``/research/<read_type>.naver``로 고정한다.
+    """
+    match = READ_LINK_RE.search(raw_href or "")
+    if not match:
+        return None
+
+    query = urlsplit(raw_href).query
+    link = f"{NAVER_BASE}/research/{match.group(1)}.naver"
+    return f"{link}?{query}" if query else link
+
+
 def parse_research_table(html_text: str, base_url: str):
     """
     네이버금융 research 목록 페이지를 파싱.
@@ -103,13 +121,10 @@ def parse_research_table(html_text: str, base_url: str):
 
             # 제목 링크 찾기
             title_tag = None
-            read_type = None
             for a in tr.find_all("a"):
                 href = a.get("href", "")
-                m = READ_LINK_RE.search(href)
-                if m:
+                if READ_LINK_RE.search(href):
                     title_tag = a
-                    read_type = m.group(1)
                     break
             if title_tag is None:
                 continue
@@ -117,13 +132,10 @@ def parse_research_table(html_text: str, base_url: str):
             if not title:
                 continue
 
-            # 링크 조립: 네이버가 상대경로/절대경로를 페이지마다 다르게 내려줘서
-            # urljoin에 의존하지 않고 "/research/<read_type>.naver?<query>" 형태로 직접 만든다.
             raw_href = title_tag.get("href", "")
-            query = raw_href.split("?", 1)[1] if "?" in raw_href else ""
-            link = f"{NAVER_BASE}/research/{read_type}.naver"
-            if query:
-                link += f"?{query}"
+            link = normalize_research_link(raw_href)
+            if not link:
+                continue
 
             # 날짜 찾기
             row_text = tr.get_text(" ", strip=True)
@@ -237,10 +249,52 @@ def _strip_code_fence(text: str) -> str:
     return text
 
 
+def _clean_summary_text(text: str) -> str:
+    """모델이 실수로 붙인 마크다운 표식을 텔레그램 본문에서 제거한다."""
+    cleaned_lines = []
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = re.sub(r"^\s*[-*]\s+", "", line)
+        line = line.replace("**", "").strip()
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def build_summary_prompt(hynix_reports, industry_reports):
+    """짧은 한두 문장이 아닌, 충분한 맥락을 담은 핵심 요약용 프롬프트."""
+    hynix_listing = "\n".join(
+        f"- {r['title']} ({r['org']}, {r['date']})" for r in hynix_reports
+    ) or "- 해당 리포트 없음"
+    industry_listing = "\n".join(
+        f"- {r['title']} ({r['org']}, {r['date']})" for r in industry_reports
+    ) or "- 해당 리포트 없음"
+
+    return (
+        "너는 SK그룹, 특히 SK하이닉스와 SK AX 취업·이직·면접을 준비하는 사람에게 "
+        "매일 아침 산업 동향의 핵심을 충분한 맥락과 함께 설명하는 코치야.\n\n"
+        "[SK하이닉스 관련 리포트]\n"
+        f"{hynix_listing}\n\n"
+        "[반도체·IT서비스·AI 산업 리포트]\n"
+        f"{industry_listing}\n\n"
+        "위 제목들에서 공통으로 읽히는 흐름만 종합해 하나의 핵심 요약을 작성해. "
+        "개별 리포트를 하나씩 나열하거나 별도의 추천 리포트 목록을 만들지 마.\n"
+        "요약은 한국어 기준 900~1,200자, 10~14개의 완결된 문장, 4개의 짧은 문단으로 구성해:\n"
+        "1문단은 오늘 시장 전체 흐름과 그 배경, "
+        "2문단은 반도체·메모리와 SK하이닉스에 미치는 영향, "
+        "3문단은 AI·데이터센터·IT서비스와 SK AX에 미치는 영향, "
+        "4문단은 지원자가 면접에서 연결해 말할 수 있는 구체적인 관점을 담아.\n"
+        "전문용어는 처음 나올 때 쉬운 말로 풀고, 제목만으로 확인할 수 없는 수치·사실은 단정하지 마. "
+        "핵심 결론뿐 아니라 왜 그런지, SK의 사업과 어떤 관련이 있는지까지 설명해.\n"
+        "제목, 소제목, 불릿, 이모지, #, ** 같은 마크다운은 사용하지 마.\n\n"
+        "아래 JSON 형식의 객체 하나만 출력해. 코드블록이나 다른 설명은 쓰지 마:\n"
+        '{"overview": "네 문단으로 구성된 핵심 요약"}'
+    )
+
+
 def summarize_with_claude(hynix_reports, industry_reports):
     """
     ANTHROPIC_API_KEY가 있으면 리포트 제목들을 재료로
-    { "overview": "...", "highlights": [{"title","detail"}, ...] } 형태의 JSON을 생성.
+    { "overview": "..." } 형태의 충분히 상세한 핵심 요약 JSON을 생성.
     키가 없거나 실패하면 None.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -252,55 +306,23 @@ def summarize_with_claude(hynix_reports, industry_reports):
         print("[WARN] anthropic 패키지가 설치되어 있지 않아 요약을 건너뜁니다.", file=sys.stderr)
         return None
 
-    all_reports = hynix_reports + industry_reports
-    if not all_reports:
+    if not hynix_reports and not industry_reports:
         return None
 
-    listing = "\n".join(f"- {r['title']} ({r['org']})" for r in all_reports)
-
-    prompt = (
-        "너는 SK그룹(특히 SK하이닉스, SK AX) 취업/이직/면접을 준비하는 사람에게 "
-        "매일 아침 산업 동향을 쉽게 설명해주는 코치야.\n"
-        "아래는 오늘 나온 반도체·메모리 및 IT서비스·AI 관련 증권사/산업 리포트 제목 목록이야 (제목 (증권사) 형태).\n\n"
-        + listing
-        + "\n\n아래 JSON 형식으로만 응답해. 다른 설명이나 마크다운 코드블록 없이 JSON 객체 하나만 출력해:\n"
-        '{\n'
-        '  "overview": "오늘 전체 흐름을 취준생이 이해하기 쉽게 2~3문장으로 (전문용어는 풀어서 설명)",\n'
-        '  "highlights": [\n'
-        '    {"title": "위 목록에 있는 제목을 정확히 그대로 복사", "detail": "이 리포트가 다룰 핵심 내용과 왜 중요한지, 면접에서 언급하면 좋을 포인트를 포함해 2~3문장"}\n'
-        "  ]\n"
-        "}\n"
-        "highlights는 가장 중요해 보이는 순서로 최대 3개만. "
-        "텍스트에 마크다운 문법(**, #, - 등)은 절대 쓰지 말고 순수 텍스트로만 작성해."
-    )
+    prompt = build_summary_prompt(hynix_reports, industry_reports)
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=800,
+            max_tokens=1800,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = _strip_code_fence(message.content[0].text)
         data = json.loads(raw)
 
-        # highlight title -> link 매칭
-        link_by_title = {r["title"]: r["link"] for r in all_reports}
-        highlights = []
-        for h in data.get("highlights", [])[:3]:
-            title = h.get("title", "").strip()
-            detail = h.get("detail", "").strip()
-            if not title or not detail:
-                continue
-            highlights.append({
-                "title": title,
-                "detail": detail,
-                "link": link_by_title.get(title),
-            })
-
         return {
-            "overview": data.get("overview", "").strip() or None,
-            "highlights": highlights,
+            "overview": _clean_summary_text(data.get("overview", "")) or None,
         }
     except Exception as e:
         print(f"[WARN] Claude 요약 생성 실패: {e}", file=sys.stderr)
@@ -328,7 +350,7 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
     summary = summarize_with_claude(hynix_reports, industry_reports)
 
     if summary and summary.get("overview"):
-        lines.append("<b>🗣 오늘의 요약</b>")
+        lines.append("<b>🗣 오늘의 핵심 요약</b>")
         lines.append(html.escape(summary["overview"]))
         lines.append("")
 
@@ -340,21 +362,9 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
         industry_tier,
     )
 
-    if summary and summary.get("highlights"):
+    if not os.environ.get("ANTHROPIC_API_KEY"):
         lines.append("")
-        lines.append("<b>🔎 오늘의 핵심 리포트</b>")
-        for h in summary["highlights"]:
-            title_escaped = html.escape(h["title"])
-            if h.get("link"):
-                title_html = f'<a href="{html.escape(h["link"], quote=True)}"><b>{title_escaped}</b></a>'
-            else:
-                title_html = f"<b>{title_escaped}</b>"
-            lines.append(title_html)
-            lines.append(html.escape(h["detail"]))
-            lines.append("")
-    elif not os.environ.get("ANTHROPIC_API_KEY"):
-        lines.append("")
-        lines.append("※ ANTHROPIC_API_KEY를 등록하면 핵심 리포트 3개를 더 자세히 풀어서 보내드려요.")
+        lines.append("※ ANTHROPIC_API_KEY를 등록하면 오늘의 핵심 흐름을 자세히 요약해서 보내드려요.")
 
     lines.append("")
     lines.append("출근길 화이팅! 🚇")

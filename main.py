@@ -73,6 +73,8 @@ def is_recent(date_str: str, days: int = LOOKBACK_DAYS) -> bool:
 
 DATE_RE = re.compile(r"\d{2}\.\d{2}\.\d{2}")
 READ_LINK_RE = re.compile(r"(company_read|industry_read|market_read|debenture_read)\.naver")
+# 행(row)의 HTML 전체에서 pdf 파일 직링크를 통째로 찾기 위한 패턴 (따옴표/공백/> 전까지)
+PDF_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.pdf", re.IGNORECASE)
 
 
 def normalize_research_link(raw_href: str):
@@ -131,12 +133,19 @@ def parse_research_table(html_text: str, base_url: str):
             date_match = DATE_RE.search(row_text)
             date_str = date_match.group(0) if date_match else ""
 
+            # 첨부 PDF 링크 찾기: href 속성만 보지 않고, 이 행의 HTML 전체(onclick, data-* 등
+            # 어디에 박혀있든)를 문자열로 훑어서 실제 pdf 파일 주소 패턴을 직접 찾는다.
+            # (네이버는 href가 아니라 자바스크립트 클릭 핸들러 안에 pdf 주소를 넣어두는 경우가 있음)
             pdf_link = None
-            for a in tr.find_all("a"):
-                href = a.get("href", "")
-                if href.lower().endswith(".pdf"):
-                    pdf_link = urljoin(base_url, href)
-                    break
+            pdf_match = PDF_URL_RE.search(str(tr))
+            if pdf_match:
+                pdf_link = pdf_match.group(0)
+            else:
+                for a in tr.find_all("a"):
+                    href = a.get("href", "")
+                    if urlsplit(href).path.lower().endswith(".pdf"):
+                        pdf_link = urljoin(base_url, href)
+                        break
 
             org = ""
             title_td = title_tag.find_parent("td")
@@ -285,7 +294,7 @@ def summarize_with_claude(hynix_reports, industry_reports):
         )
         data = json.loads(_strip_code_fence(message.content[0].text))
 
-        link_by_title = {r["title"]: r["link"] for r in all_reports}
+        link_by_title = {r["title"]: primary_link(r) for r in all_reports}
         highlights = []
         for h in data.get("highlights", [])[:3]:
             title = _clean(h.get("title", ""))
@@ -303,18 +312,25 @@ def summarize_with_claude(hynix_reports, industry_reports):
 NUMBER_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
 
 
+def primary_link(r):
+    """
+    모바일에서 finance.naver.com 상세페이지 링크를 열면 네이버가 자체적으로
+    m.stock.naver.com의 목록 화면으로 리다이렉트시켜버려 원하는 리포트가 안 열리는
+    경우가 있다. stock.pstatic.net에 직접 호스팅된 PDF는 그런 리다이렉트 없이
+    바로 열리므로, PDF가 있으면 PDF를 우선 링크로 쓴다.
+    """
+    return r.get("pdf") or r["link"]
+
+
 def _link_list(reports, tier):
-    """전체 리포트를 링크만 있는 간단한 형태로 렌더링 (PDF 있으면 같이)."""
+    """전체 리포트를 링크만 있는 간단한 형태로 렌더링."""
     lines = []
     note = FALLBACK_NOTES.get(tier)
     if note:
         lines.append(html.escape(note))
     if reports:
         for r in reports:
-            title_link = f'<a href="{html.escape(r["link"], quote=True)}">{html.escape(r["title"])}</a>'
-            if r.get("pdf"):
-                title_link += f' (<a href="{html.escape(r["pdf"], quote=True)}">PDF</a>)'
-            lines.append(f"• {title_link}")
+            lines.append(f'• <a href="{html.escape(primary_link(r), quote=True)}">{html.escape(r["title"])}</a>')
     else:
         lines.append("· 가져온 리포트 없음 (사이트 구조 변경 등으로 파싱 실패 가능성)")
     return lines

@@ -335,7 +335,9 @@ def build_summary_prompt(materials):
     return (
         "너는 SK그룹(특히 SK하이닉스, SK AX) 취업·이직·면접을 준비하는 사람에게 "
         "출근길 지하철에서 1~2분 안에 훑어볼 아침 브리핑을 써주는 코치야. "
-        "PDF를 직접 열어볼 필요 없이 핵심만 딱 눈에 들어오게 정리해줘.\n\n"
+        "PDF를 직접 열어볼 필요 없이 핵심만 딱 눈에 들어오게 정리해줘. "
+        "단순히 정보를 나열하지 말고, 이 사람이 면접에서 실제로 써먹을 수 있게 "
+        "'그래서 이게 왜 중요한지'까지 연결해줘.\n\n"
         + "\n\n---\n\n".join(blocks)
         + "\n\n아래 JSON 형식으로만 응답해. 다른 설명이나 코드블록 없이 JSON 객체 하나만:\n"
         "{\n"
@@ -344,12 +346,14 @@ def build_summary_prompt(materials):
         "    {\n"
         '      "title": "위 [리포트 N]의 제목을 정확히 그대로 복사",\n'
         '      "key_points": ["실제 본문에 나온 핵심 내용을 짧은 문장으로", "최대 3개까지"],\n'
-        '      "concept": {"term": "본문에 나온 용어 중 취준생이 모를 만한 것 하나", "explain": "그 용어를 한 문장으로 쉽게 풀이"}\n'
+        '      "concept": {"term": "본문에 나온 용어 중 취준생이 모를 만한 것 하나", "explain": "그 용어를 한 문장으로 쉽게 풀이"},\n'
+        '      "interview_note": "이 내용을 면접에서 어떻게 언급하면 좋을지, 실제로 말하듯 1문장으로 (예: \'~라고 답하면서 ~를 강조할 수 있어요\')"\n'
         "    }\n"
         "  ]\n"
         "}\n"
         "items는 입력된 리포트 개수만큼 순서대로. "
         "concept은 마땅한 용어가 없으면 그 리포트의 concept 필드를 통째로 생략해도 됨. "
+        "interview_note는 매 리포트마다 반드시 채우고, 뻔한 말 말고 이 리포트 내용과 구체적으로 연결해서 써. "
         "본문에 없는 수치나 사실은 단정하지 말고, 마크다운 문법(**, #, - 등)은 절대 쓰지 마."
     )
 
@@ -417,10 +421,12 @@ def summarize_with_claude(hynix_reports, industry_reports):
                 term = _clean(concept.get("term", ""), 80)
                 explain = _clean(concept.get("explain", ""), 200)
                 concept = {"term": term, "explain": explain} if term and explain else None
+            interview_note = _clean(it.get("interview_note", ""), 220) or None
             items.append({
                 "title": title,
                 "key_points": key_points,
                 "concept": concept,
+                "interview_note": interview_note,
                 "link": link_by_title.get(title),
             })
 
@@ -474,6 +480,8 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
                 term = html.escape(it["concept"]["term"])
                 explain = html.escape(it["concept"]["explain"])
                 lines.append(f"  💡 <b>{term}</b>: {explain}")
+            if it.get("interview_note"):
+                lines.append(f"  🎯 <b>면접 연결</b>: {html.escape(it['interview_note'])}")
             lines.append("")
     elif not os.environ.get("ANTHROPIC_API_KEY"):
         lines.append("※ ANTHROPIC_API_KEY를 등록하면 오늘의 핵심 리포트를 실제로 읽고 요약해드려요.")

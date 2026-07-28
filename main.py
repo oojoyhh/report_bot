@@ -312,22 +312,60 @@ def extract_pdf_text(pdf_url: str):
         return None
 
 
-def select_top_candidates(hynix_reports, industry_reports, n=3):
+STATE_PATH = "state/sent_titles.json"
+STATE_KEEP_DAYS = 30
+
+
+def load_sent_state(path: str = STATE_PATH) -> dict:
+    """예전에 '오늘의 핵심 리포트'로 이미 보낸 제목들과 마지막으로 보낸 날짜."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_sent_state(state: dict, path: str = STATE_PATH, keep_days: int = STATE_KEEP_DAYS):
+    """오래된 기록은 지우고 저장한다 (파일이 무한히 커지지 않도록)."""
+    cutoff = kst_today() - datetime.timedelta(days=keep_days)
+    pruned = {}
+    for title, date_str in state.items():
+        try:
+            d = datetime.date.fromisoformat(date_str)
+        except ValueError:
+            continue
+        if d >= cutoff:
+            pruned[title] = date_str
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(pruned, f, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"[WARN] 상태 파일 저장 실패: {e}", file=sys.stderr)
+
+
+def select_top_candidates(hynix_reports, industry_reports, sent_titles, n=3):
     """
-    하이닉스/산업동향 양쪽에서 최소 1개씩은 포함되도록 우선 선정하고,
-    남은 자리는 PDF 유무와 최근성을 기준으로 채운다.
+    하이닉스/산업동향 양쪽에서 최소 1개씩은 포함되도록 우선 선정하되,
+    이미 예전에 '오늘의 핵심'으로 보낸 적 있는 제목은 최대한 피하고
+    (진짜 새 리포트가 없을 때만 어쩔 수 없이 재사용), 그 안에서는
+    PDF 유무와 최근성 순으로 채운다.
     """
+    def sort_key(r):
+        return (
+            r["title"] not in sent_titles,  # 처음 보내는 것 우선
+            bool(r.get("pdf")),
+            parse_date(r.get("date", "")) or datetime.date.min,
+        )
+
     def best(pool):
         if not pool:
             return None
-        return next((r for r in pool if r.get("pdf")), pool[0])
+        return sorted(pool, key=sort_key, reverse=True)[0]
 
     selected = [r for r in (best(hynix_reports), best(industry_reports)) if r is not None][:n]
     remaining = [r for r in (hynix_reports + industry_reports) if r not in selected]
-    remaining.sort(
-        key=lambda r: (bool(r.get("pdf")), parse_date(r.get("date", "")) or datetime.date.min),
-        reverse=True,
-    )
+    remaining.sort(key=sort_key, reverse=True)
     selected.extend(remaining[: max(0, n - len(selected))])
     return selected[:n]
 
@@ -394,7 +432,8 @@ def summarize_with_claude(hynix_reports, industry_reports):
     키가 없거나 후보가 없으면 None.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    candidates = select_top_candidates(hynix_reports, industry_reports)
+    sent_state = load_sent_state()
+    candidates = select_top_candidates(hynix_reports, industry_reports, set(sent_state))
     if not api_key or not candidates:
         return None
     try:
@@ -444,6 +483,12 @@ def summarize_with_claude(hynix_reports, industry_reports):
                 "link": link_by_title.get(title),
                 "pdf": pdf_by_title.get(title),
             })
+
+        # 오늘 실제로 다룬 리포트는 상태 파일에 기록해서, 다음 실행 때 최대한 안 겹치게 한다.
+        today_str = kst_today().isoformat()
+        for it in items:
+            sent_state[it["title"]] = today_str
+        save_sent_state(sent_state)
 
         return {"overview": _clean(data.get("overview", ""), 300) or None, "items": items}
     except Exception as e:

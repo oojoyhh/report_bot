@@ -8,7 +8,7 @@ GitHub Actions 등 일반 인터넷 접속이 가능한 환경에서 실행하�
 환경변수:
   TELEGRAM_BOT_TOKEN   (필수) 텔레그램 봇 토큰
   TELEGRAM_CHAT_ID     (필수) 메시지를 받을 chat id
-  ANTHROPIC_API_KEY    (선택) 있으면 리포트 제목들을 쉬운 말로 풀어쓴 요약을 추가로 생성
+  ANTHROPIC_API_KEY    (선택) 있으면 오늘의 핵심 리포트 3개를 뽑아 쉬운 말로 설명 추가
   DRY_RUN              "1"이면 텔레그램 전송 없이 콘솔에만 출력
 """
 
@@ -18,7 +18,7 @@ import sys
 import json
 import html
 import datetime
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -41,19 +41,18 @@ INDUSTRY_KEYWORDS = [
 ]
 
 LOOKBACK_DAYS = 3  # 최근 N일 이내 리포트만 채택 (주말/휴장 대비 여유)
+MAX_ITEMS = 5  # 섹션당 최대 표시 건수
 
 
 def fetch_html(url: str) -> str:
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    # 네이버금융은 EUC-KR 인코딩을 쓰는 경우가 많음
     if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
         resp.encoding = "euc-kr"
     return resp.text
 
 
 def parse_date(date_str: str):
-    """'25.07.28' 형태 문자열을 datetime.date로 변환. 실패 시 None."""
     date_str = date_str.strip()
     m = re.match(r"(\d{2})\.(\d{2})\.(\d{2})", date_str)
     if not m:
@@ -73,38 +72,32 @@ def is_recent(date_str: str, days: int = LOOKBACK_DAYS) -> bool:
 
 
 DATE_RE = re.compile(r"\d{2}\.\d{2}\.\d{2}")
-# 리포트 상세페이지 링크 패턴 (컬럼 위치에 의존하지 않기 위해 이걸로 제목 링크를 찾는다)
 READ_LINK_RE = re.compile(r"(company_read|industry_read|market_read|debenture_read)\.naver")
 
 
 def normalize_research_link(raw_href: str):
     """
-    네이버 리서치 상세 링크를 항상 /research/... 주소로 정규화한다.
+    네이버 리서치 상세 링크를 /research/<read_type>.naver?nid=..&page=.. 형태로 정규화.
 
-    목록 페이지의 href는 ``company_read.naver?...`` 같은 상대경로인데,
-    이를 네이버 도메인 루트에 바로 붙이면 존재하지 않는
-    ``/company_read.naver`` 주소가 된다. 상대/절대경로 여부와 관계없이
-    실제 상세 페이지가 있는 ``/research/<read_type>.naver``로 고정한다.
+    목록 페이지 앵커에는 searchType/itemCode 같은 '목록 화면 문맥용' 파라미터가
+    같이 붙어오는데, 이걸 그대로 상세페이지 주소에 옮기면 정상적으로 안 열리고
+    메인 화면으로 리다이렉트되는 경우가 있어서 nid/page만 남긴다.
     """
     match = READ_LINK_RE.search(raw_href or "")
     if not match:
         return None
-
-    query = urlsplit(raw_href).query
-    link = f"{NAVER_BASE}/research/{match.group(1)}.naver"
-    return f"{link}?{query}" if query else link
+    qs = parse_qs(urlsplit(raw_href).query)
+    nid = qs.get("nid", [None])[0]
+    if not nid:
+        return None
+    page = qs.get("page", ["1"])[0]
+    return f"{NAVER_BASE}/research/{match.group(1)}.naver?nid={nid}&page={page}"
 
 
 def parse_research_table(html_text: str, base_url: str):
     """
-    네이버금융 research 목록 페이지를 파싱.
-    컬럼 순서(종목명/제목/증권사/첨부/작성일)가 페이지마다 조금씩 달라질 수 있어서,
-    컬럼 인덱스에 의존하지 않고 각 행(tr)에서
-      - 제목: '_read.naver' 상세페이지로 가는 <a> 태그
-      - 날짜: 행 텍스트에서 'YY.MM.DD' 패턴
-      - 첨부(pdf): href가 '.pdf'로 끝나는 <a> 태그
-      - 증권사: 나머지 <td> 텍스트 중 제목/날짜가 아닌 것
-    을 각각 찾아서 조립한다.
+    네이버금융 research 목록 페이지를 파싱. 컬럼 위치에 의존하지 않고
+    각 행(tr)에서 제목 링크(_read.naver), 날짜(YY.MM.DD), 첨부 pdf, 증권사를 찾아 조립.
     """
     soup = BeautifulSoup(html_text, "html.parser")
     tables = soup.find_all("table")
@@ -119,11 +112,9 @@ def parse_research_table(html_text: str, base_url: str):
             if not tds:
                 continue
 
-            # 제목 링크 찾기
             title_tag = None
             for a in tr.find_all("a"):
-                href = a.get("href", "")
-                if READ_LINK_RE.search(href):
+                if READ_LINK_RE.search(a.get("href", "")):
                     title_tag = a
                     break
             if title_tag is None:
@@ -132,17 +123,14 @@ def parse_research_table(html_text: str, base_url: str):
             if not title:
                 continue
 
-            raw_href = title_tag.get("href", "")
-            link = normalize_research_link(raw_href)
+            link = normalize_research_link(title_tag.get("href", ""))
             if not link:
                 continue
 
-            # 날짜 찾기
             row_text = tr.get_text(" ", strip=True)
             date_match = DATE_RE.search(row_text)
             date_str = date_match.group(0) if date_match else ""
 
-            # 첨부(pdf) 링크 찾기
             pdf_link = None
             for a in tr.find_all("a"):
                 href = a.get("href", "")
@@ -150,8 +138,6 @@ def parse_research_table(html_text: str, base_url: str):
                     pdf_link = urljoin(base_url, href)
                     break
 
-            # 증권사(작성기관) 추정: 제목이 들어있는 td '이후'의 td들 중
-            # 비어있지 않고 날짜/제목이 아닌 첫 텍스트 (제목 이전 td는 종목명 컬럼일 수 있어 제외)
             org = ""
             title_td = title_tag.find_parent("td")
             try:
@@ -177,9 +163,6 @@ def parse_research_table(html_text: str, base_url: str):
     return reports
 
 
-MAX_ITEMS = 5  # 섹션당 최대 표시 건수
-
-# 각 단계(tier)에 대한 사람이 읽을 설명 (메시지에 표시됨)
 FALLBACK_NOTES = {
     "recent": None,
     "keyword_any_date": f"※ 최근 {LOOKBACK_DAYS}일 내 신규 리포트가 없어서, 조건에 맞는 가장 최근 리포트로 채웠어요.",
@@ -203,7 +186,7 @@ def fetch_hynix_reports():
         return tier1[:MAX_ITEMS], "recent"
 
     if reports:
-        print(f"[DEBUG] 하이닉스: 최근 리포트 없음 → 전체 {len(reports)}건 중 최신 {MAX_ITEMS}건으로 대체", file=sys.stderr)
+        print(f"[DEBUG] 하이닉스: 최근 리포트 없음 → 최신 {MAX_ITEMS}건으로 대체", file=sys.stderr)
         return reports[:MAX_ITEMS], "fallback_latest"
 
     print("[DEBUG] 하이닉스: 파싱된 리포트 자체가 0건", file=sys.stderr)
@@ -222,11 +205,7 @@ def fetch_industry_reports():
 
     tier1 = [r for r in keyword_matched if is_recent(r["date"])]
     if tier1:
-        print(
-            f"[DEBUG] 산업분석: 키워드+최근 {len(tier1)}건 "
-            f"(키워드매칭 {len(keyword_matched)}건 / 전체 {len(reports)}건)",
-            file=sys.stderr,
-        )
+        print(f"[DEBUG] 산업분석: 키워드+최근 {len(tier1)}건 (키워드매칭 {len(keyword_matched)}건 / 전체 {len(reports)}건)", file=sys.stderr)
         return tier1[:MAX_ITEMS], "recent"
 
     if keyword_matched:
@@ -234,7 +213,7 @@ def fetch_industry_reports():
         return keyword_matched[:MAX_ITEMS], "keyword_any_date"
 
     if reports:
-        print(f"[DEBUG] 산업분석: 키워드매칭 0건 → 전체 {len(reports)}건 중 최신 {MAX_ITEMS}건으로 대체", file=sys.stderr)
+        print(f"[DEBUG] 산업분석: 키워드매칭 0건 → 최신 {MAX_ITEMS}건으로 대체", file=sys.stderr)
         return reports[:MAX_ITEMS], "fallback_latest"
 
     print("[DEBUG] 산업분석: 파싱된 리포트 자체가 0건", file=sys.stderr)
@@ -249,52 +228,19 @@ def _strip_code_fence(text: str) -> str:
     return text
 
 
-def _clean_summary_text(text: str) -> str:
-    """모델이 실수로 붙인 마크다운 표식을 텔레그램 본문에서 제거한다."""
-    cleaned_lines = []
-    for line in (text or "").replace("\r\n", "\n").split("\n"):
-        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
-        line = re.sub(r"^\s*[-*]\s+", "", line)
-        line = line.replace("**", "").strip()
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines).strip()
-
-
-def build_summary_prompt(hynix_reports, industry_reports):
-    """짧은 한두 문장이 아닌, 충분한 맥락을 담은 핵심 요약용 프롬프트."""
-    hynix_listing = "\n".join(
-        f"- {r['title']} ({r['org']}, {r['date']})" for r in hynix_reports
-    ) or "- 해당 리포트 없음"
-    industry_listing = "\n".join(
-        f"- {r['title']} ({r['org']}, {r['date']})" for r in industry_reports
-    ) or "- 해당 리포트 없음"
-
-    return (
-        "너는 SK그룹, 특히 SK하이닉스와 SK AX 취업·이직·면접을 준비하는 사람에게 "
-        "매일 아침 산업 동향의 핵심을 충분한 맥락과 함께 설명하는 코치야.\n\n"
-        "[SK하이닉스 관련 리포트]\n"
-        f"{hynix_listing}\n\n"
-        "[반도체·IT서비스·AI 산업 리포트]\n"
-        f"{industry_listing}\n\n"
-        "위 제목들에서 공통으로 읽히는 흐름만 종합해 하나의 핵심 요약을 작성해. "
-        "개별 리포트를 하나씩 나열하거나 별도의 추천 리포트 목록을 만들지 마.\n"
-        "요약은 한국어 기준 900~1,200자, 10~14개의 완결된 문장, 4개의 짧은 문단으로 구성해:\n"
-        "1문단은 오늘 시장 전체 흐름과 그 배경, "
-        "2문단은 반도체·메모리와 SK하이닉스에 미치는 영향, "
-        "3문단은 AI·데이터센터·IT서비스와 SK AX에 미치는 영향, "
-        "4문단은 지원자가 면접에서 연결해 말할 수 있는 구체적인 관점을 담아.\n"
-        "전문용어는 처음 나올 때 쉬운 말로 풀고, 제목만으로 확인할 수 없는 수치·사실은 단정하지 마. "
-        "핵심 결론뿐 아니라 왜 그런지, SK의 사업과 어떤 관련이 있는지까지 설명해.\n"
-        "제목, 소제목, 불릿, 이모지, #, ** 같은 마크다운은 사용하지 마.\n\n"
-        "아래 JSON 형식의 객체 하나만 출력해. 코드블록이나 다른 설명은 쓰지 마:\n"
-        '{"overview": "네 문단으로 구성된 핵심 요약"}'
-    )
+def _clean(text: str) -> str:
+    """모델이 실수로 붙인 마크다운 표식을 제거."""
+    text = (text or "").replace("\r\n", "\n")
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*]\s+", "", text, flags=re.MULTILINE)
+    text = text.replace("**", "")
+    return text.strip()
 
 
 def summarize_with_claude(hynix_reports, industry_reports):
     """
-    ANTHROPIC_API_KEY가 있으면 리포트 제목들을 재료로
-    { "overview": "..." } 형태의 충분히 상세한 핵심 요약 JSON을 생성.
+    ANTHROPIC_API_KEY가 있으면
+    { "overview": "한 줄 총평", "highlights": [{"title","detail"}, ...] } 를 생성.
     키가 없거나 실패하면 None.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -306,38 +252,69 @@ def summarize_with_claude(hynix_reports, industry_reports):
         print("[WARN] anthropic 패키지가 설치되어 있지 않아 요약을 건너뜁니다.", file=sys.stderr)
         return None
 
-    if not hynix_reports and not industry_reports:
+    all_reports = hynix_reports + industry_reports
+    if not all_reports:
         return None
 
-    prompt = build_summary_prompt(hynix_reports, industry_reports)
+    listing = "\n".join(f"- {r['title']} ({r['org']}, {r['date']})" for r in all_reports)
+
+    prompt = (
+        "너는 SK그룹(특히 SK하이닉스, SK AX) 취업·이직·면접을 준비하는 사람에게 "
+        "출근길에 1분 안에 읽을 아침 브리핑을 써주는 코치야. 아침이라 길게 읽을 여유가 없으니 "
+        "핵심만 빠르게 눈에 들어오게 써야 해.\n\n"
+        "아래는 오늘 나온 반도체·메모리 및 IT서비스·AI 관련 증권사/산업 리포트 목록이야 "
+        "(제목 (증권사, 날짜) 형태):\n\n"
+        f"{listing}\n\n"
+        "아래 JSON 형식으로만 응답해. 다른 설명이나 코드블록 없이 JSON 객체 하나만:\n"
+        "{\n"
+        '  "overview": "오늘 흐름을 한 문장으로 (짧고 임팩트있게)",\n'
+        '  "highlights": [\n'
+        '    {"title": "위 목록의 제목을 정확히 그대로 복사", "detail": "이 리포트가 다루는 핵심과 SK와의 연결점을 딱 2문장으로, 면접에서 쓸 수 있는 포인트 포함"}\n'
+        "  ]\n"
+        "}\n"
+        "highlights는 가장 중요한 순서로 정확히 3개(재료가 3개 미만이면 있는 만큼만). "
+        "마크다운 문법(**, #, - 등)은 절대 쓰지 말고 순수 텍스트로만, 문장은 최대한 짧고 명확하게."
+    )
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1800,
+            max_tokens=900,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = _strip_code_fence(message.content[0].text)
-        data = json.loads(raw)
+        data = json.loads(_strip_code_fence(message.content[0].text))
 
-        return {
-            "overview": _clean_summary_text(data.get("overview", "")) or None,
-        }
+        link_by_title = {r["title"]: r["link"] for r in all_reports}
+        highlights = []
+        for h in data.get("highlights", [])[:3]:
+            title = _clean(h.get("title", ""))
+            detail = _clean(h.get("detail", ""))
+            if not title or not detail:
+                continue
+            highlights.append({"title": title, "detail": detail, "link": link_by_title.get(title)})
+
+        return {"overview": _clean(data.get("overview", "")) or None, "highlights": highlights}
     except Exception as e:
         print(f"[WARN] Claude 요약 생성 실패: {e}", file=sys.stderr)
         return None
 
 
-def _section(title_line, reports, tier):
-    """리포트 목록을 링크만 있는 간단한 형태로 렌더링."""
-    lines = [title_line]
+NUMBER_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+
+
+def _link_list(reports, tier):
+    """전체 리포트를 링크만 있는 간단한 형태로 렌더링 (PDF 있으면 같이)."""
+    lines = []
     note = FALLBACK_NOTES.get(tier)
     if note:
         lines.append(html.escape(note))
     if reports:
         for r in reports:
-            lines.append(f'• <a href="{html.escape(r["link"], quote=True)}">{html.escape(r["title"])}</a>')
+            title_link = f'<a href="{html.escape(r["link"], quote=True)}">{html.escape(r["title"])}</a>'
+            if r.get("pdf"):
+                title_link += f' (<a href="{html.escape(r["pdf"], quote=True)}">PDF</a>)'
+            lines.append(f"• {title_link}")
     else:
         lines.append("· 가져온 리포트 없음 (사이트 구조 변경 등으로 파싱 실패 가능성)")
     return lines
@@ -345,26 +322,36 @@ def _section(title_line, reports, tier):
 
 def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
     today = datetime.date.today().strftime("%Y.%m.%d")
-    lines = [f"<b>📊 SK 산업동향 브리핑 ({today})</b>", ""]
+    lines = [f"<b>📊 SK 산업동향 브리핑 ({today})</b>"]
 
     summary = summarize_with_claude(hynix_reports, industry_reports)
 
     if summary and summary.get("overview"):
-        lines.append("<b>🗣 오늘의 핵심 요약</b>")
         lines.append(html.escape(summary["overview"]))
-        lines.append("")
 
-    lines += _section(f"<b>🔧 SK하이닉스 관련 리포트 ({len(hynix_reports)}건)</b>", hynix_reports, hynix_tier)
     lines.append("")
-    lines += _section(
-        f"<b>💡 반도체·IT서비스/AI 산업동향 ({len(industry_reports)}건)</b>",
-        industry_reports,
-        industry_tier,
-    )
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if summary and summary.get("highlights"):
+        lines.append("<b>🔎 오늘의 핵심 3</b>")
+        for i, h in enumerate(summary["highlights"]):
+            num = NUMBER_EMOJI[i] if i < len(NUMBER_EMOJI) else f"{i + 1}."
+            title_escaped = html.escape(h["title"])
+            title_html = (
+                f'<a href="{html.escape(h["link"], quote=True)}"><b>{title_escaped}</b></a>'
+                if h.get("link") else f"<b>{title_escaped}</b>"
+            )
+            lines.append(f"{num} {title_html}")
+            lines.append(html.escape(h["detail"]))
+            lines.append("")
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
+        lines.append("※ ANTHROPIC_API_KEY를 등록하면 오늘의 핵심 리포트 3개를 뽑아 쉽게 설명해드려요.")
         lines.append("")
-        lines.append("※ ANTHROPIC_API_KEY를 등록하면 오늘의 핵심 흐름을 자세히 요약해서 보내드려요.")
+
+    lines.append(f"<b>🔧 SK하이닉스 리포트 전체 ({len(hynix_reports)}건)</b>")
+    lines += _link_list(hynix_reports, hynix_tier)
+    lines.append("")
+    lines.append(f"<b>💡 반도체·IT서비스/AI 산업동향 전체 ({len(industry_reports)}건)</b>")
+    lines += _link_list(industry_reports, industry_tier)
 
     lines.append("")
     lines.append("출근길 화이팅! 🚇")
@@ -374,7 +361,6 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
 
 def send_telegram(token: str, chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    # 텔레그램 메시지 길이 제한(4096자) 대응: 필요시 분할 전송
     chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)] or [text]
     for chunk in chunks:
         resp = requests.post(

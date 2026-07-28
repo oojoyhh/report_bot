@@ -70,37 +70,92 @@ def is_recent(date_str: str, days: int = LOOKBACK_DAYS) -> bool:
     return (datetime.date.today() - d).days <= days
 
 
+DATE_RE = re.compile(r"\d{2}\.\d{2}\.\d{2}")
+# 리포트 상세페이지 링크 패턴 (컬럼 위치에 의존하지 않기 위해 이걸로 제목 링크를 찾는다)
+READ_LINK_RE = re.compile(r"(company_read|industry_read|market_read|debenture_read)\.naver")
+
+
 def parse_research_table(html_text: str, base_url: str):
-    """네이버금융 research 목록 테이블(class='type_1')을 파싱."""
+    """
+    네이버금융 research 목록 페이지를 파싱.
+    컬럼 순서(종목명/제목/증권사/첨부/작성일)가 페이지마다 조금씩 달라질 수 있어서,
+    컬럼 인덱스에 의존하지 않고 각 행(tr)에서
+      - 제목: '_read.naver' 상세페이지로 가는 <a> 태그
+      - 날짜: 행 텍스트에서 'YY.MM.DD' 패턴
+      - 첨부(pdf): href가 '.pdf'로 끝나는 <a> 태그
+      - 증권사: 나머지 <td> 텍스트 중 제목/날짜가 아닌 것
+    을 각각 찾아서 조립한다.
+    """
     soup = BeautifulSoup(html_text, "html.parser")
-    table = soup.find("table", class_="type_1")
-    if table is None:
+    tables = soup.find_all("table")
+    if not tables:
+        print("[DEBUG] 페이지에서 <table>을 하나도 찾지 못함", file=sys.stderr)
         return []
 
     reports = []
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 4:
-            continue
-        title_tag = tds[0].find("a")
-        if title_tag is None:
-            continue
-        title = title_tag.get_text(strip=True)
-        if not title:
-            continue
-        link = urljoin(base_url, title_tag.get("href", ""))
-        org = tds[1].get_text(strip=True)
-        pdf_tag = tds[2].find("a")
-        pdf_link = urljoin(base_url, pdf_tag.get("href", "")) if pdf_tag else None
-        date_str = tds[3].get_text(strip=True)
-        reports.append({
-            "title": title,
-            "org": org,
-            "date": date_str,
-            "link": link,
-            "pdf": pdf_link,
-        })
+    for table in tables:
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+
+            # 제목 링크 찾기
+            title_tag = None
+            for a in tr.find_all("a"):
+                href = a.get("href", "")
+                if READ_LINK_RE.search(href):
+                    title_tag = a
+                    break
+            if title_tag is None:
+                continue
+            title = title_tag.get_text(strip=True)
+            if not title:
+                continue
+            link = urljoin(base_url, title_tag.get("href", ""))
+
+            # 날짜 찾기
+            row_text = tr.get_text(" ", strip=True)
+            date_match = DATE_RE.search(row_text)
+            date_str = date_match.group(0) if date_match else ""
+
+            # 첨부(pdf) 링크 찾기
+            pdf_link = None
+            for a in tr.find_all("a"):
+                href = a.get("href", "")
+                if href.lower().endswith(".pdf"):
+                    pdf_link = urljoin(base_url, href)
+                    break
+
+            # 증권사(작성기관) 추정: 제목/날짜가 아닌 td 텍스트 중 첫번째
+            org = ""
+            for td in tds:
+                txt = td.get_text(strip=True)
+                if not txt or txt == title or DATE_RE.fullmatch(txt):
+                    continue
+                org = txt
+                break
+
+            reports.append({
+                "title": title,
+                "org": org,
+                "date": date_str,
+                "link": link,
+                "pdf": pdf_link,
+            })
+
+    print(f"[DEBUG] parse_research_table: {len(reports)}건 파싱됨", file=sys.stderr)
     return reports
+
+
+MAX_ITEMS = 5  # 섹션당 최대 표시 건수
+
+# 각 단계(tier)에 대한 사람이 읽을 설명 (메시지에 표시됨)
+FALLBACK_NOTES = {
+    "recent": None,
+    "keyword_any_date": f"※ 최근 {LOOKBACK_DAYS}일 내 신규 리포트가 없어서, 조건에 맞는 가장 최근 리포트로 채웠어요.",
+    "fallback_latest": "※ 조건에 맞는 리포트가 없어서, 최신 리포트로 대신 채웠어요.",
+    "none": None,
+}
 
 
 def fetch_hynix_reports():
@@ -109,9 +164,20 @@ def fetch_hynix_reports():
         html_text = fetch_html(url)
     except Exception as e:
         print(f"[WARN] SK하이닉스 리포트 조회 실패: {e}", file=sys.stderr)
-        return []
+        return [], "none"
     reports = parse_research_table(html_text, NAVER_BASE)
-    return [r for r in reports if is_recent(r["date"])]
+
+    tier1 = [r for r in reports if is_recent(r["date"])]
+    if tier1:
+        print(f"[DEBUG] 하이닉스: 최근 {LOOKBACK_DAYS}일 이내 {len(tier1)}건 (전체 {len(reports)}건)", file=sys.stderr)
+        return tier1[:MAX_ITEMS], "recent"
+
+    if reports:
+        print(f"[DEBUG] 하이닉스: 최근 리포트 없음 → 전체 {len(reports)}건 중 최신 {MAX_ITEMS}건으로 대체", file=sys.stderr)
+        return reports[:MAX_ITEMS], "fallback_latest"
+
+    print("[DEBUG] 하이닉스: 파싱된 리포트 자체가 0건", file=sys.stderr)
+    return [], "none"
 
 
 def fetch_industry_reports():
@@ -120,15 +186,29 @@ def fetch_industry_reports():
         html_text = fetch_html(url)
     except Exception as e:
         print(f"[WARN] 산업분석 리포트 조회 실패: {e}", file=sys.stderr)
-        return []
+        return [], "none"
     reports = parse_research_table(html_text, NAVER_BASE)
-    matched = []
-    for r in reports:
-        if not is_recent(r["date"]):
-            continue
-        if any(kw in r["title"] for kw in INDUSTRY_KEYWORDS):
-            matched.append(r)
-    return matched
+    keyword_matched = [r for r in reports if any(kw in r["title"] for kw in INDUSTRY_KEYWORDS)]
+
+    tier1 = [r for r in keyword_matched if is_recent(r["date"])]
+    if tier1:
+        print(
+            f"[DEBUG] 산업분석: 키워드+최근 {len(tier1)}건 "
+            f"(키워드매칭 {len(keyword_matched)}건 / 전체 {len(reports)}건)",
+            file=sys.stderr,
+        )
+        return tier1[:MAX_ITEMS], "recent"
+
+    if keyword_matched:
+        print(f"[DEBUG] 산업분석: 최근 것 없어 키워드매칭 {len(keyword_matched)}건(날짜무관)으로 대체", file=sys.stderr)
+        return keyword_matched[:MAX_ITEMS], "keyword_any_date"
+
+    if reports:
+        print(f"[DEBUG] 산업분석: 키워드매칭 0건 → 전체 {len(reports)}건 중 최신 {MAX_ITEMS}건으로 대체", file=sys.stderr)
+        return reports[:MAX_ITEMS], "fallback_latest"
+
+    print("[DEBUG] 산업분석: 파싱된 리포트 자체가 0건", file=sys.stderr)
+    return [], "none"
 
 
 def summarize_with_claude(hynix_reports, industry_reports):
@@ -158,7 +238,7 @@ def summarize_with_claude(hynix_reports, industry_reports):
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -168,7 +248,20 @@ def summarize_with_claude(hynix_reports, industry_reports):
         return None
 
 
-def build_message(hynix_reports, industry_reports):
+def _section(title_line, reports, tier):
+    lines = [title_line]
+    note = FALLBACK_NOTES.get(tier)
+    if note:
+        lines.append(note)
+    if reports:
+        for r in reports:
+            lines.append(f'• <a href="{r["link"]}">{r["title"]}</a> — {r["org"]} ({r["date"]})')
+    else:
+        lines.append("· 가져온 리포트 없음 (사이트 구조 변경 등으로 파싱 실패 가능성)")
+    return lines
+
+
+def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
     today = datetime.date.today().strftime("%Y.%m.%d")
     lines = [f"<b>📊 SK 산업동향 브리핑 ({today})</b>", ""]
 
@@ -178,20 +271,13 @@ def build_message(hynix_reports, industry_reports):
         lines.append(summary)
         lines.append("")
 
-    lines.append(f"<b>🔧 SK하이닉스 관련 리포트 ({len(hynix_reports)}건)</b>")
-    if hynix_reports:
-        for r in hynix_reports:
-            lines.append(f'• <a href="{r["link"]}">{r["title"]}</a> — {r["org"]} ({r["date"]})')
-    else:
-        lines.append("· 최근 신규 리포트 없음")
+    lines += _section(f"<b>🔧 SK하이닉스 관련 리포트 ({len(hynix_reports)}건)</b>", hynix_reports, hynix_tier)
     lines.append("")
-
-    lines.append(f"<b>💡 반도체·IT서비스/AI 산업동향 ({len(industry_reports)}건)</b>")
-    if industry_reports:
-        for r in industry_reports:
-            lines.append(f'• <a href="{r["link"]}">{r["title"]}</a> — {r["org"]} ({r["date"]})')
-    else:
-        lines.append("· 최근 신규 리포트 없음")
+    lines += _section(
+        f"<b>💡 반도체·IT서비스/AI 산업동향 ({len(industry_reports)}건)</b>",
+        industry_reports,
+        industry_tier,
+    )
 
     lines.append("")
     lines.append("출근길 화이팅! 🚇")
@@ -229,10 +315,10 @@ def main():
         print("[ERROR] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 환경변수가 필요합니다.", file=sys.stderr)
         sys.exit(1)
 
-    hynix_reports = fetch_hynix_reports()
-    industry_reports = fetch_industry_reports()
+    hynix_reports, hynix_tier = fetch_hynix_reports()
+    industry_reports, industry_tier = fetch_industry_reports()
 
-    message = build_message(hynix_reports, industry_reports)
+    message = build_message(hynix_reports, hynix_tier, industry_reports, industry_tier)
 
     if dry_run:
         print(message)

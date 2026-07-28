@@ -410,6 +410,7 @@ def summarize_with_claude(hynix_reports, industry_reports):
         data = json.loads(_strip_code_fence(message.content[0].text))
 
         link_by_title = {m["report"]["title"]: primary_link(m["report"]) for m in materials}
+        pdf_by_title = {m["report"]["title"]: m["report"].get("pdf") for m in materials}
         items = []
         for it in data.get("items", [])[:len(candidates)]:
             title = _clean(it.get("title", ""), 200)
@@ -428,6 +429,7 @@ def summarize_with_claude(hynix_reports, industry_reports):
                 "concept": concept,
                 "interview_note": interview_note,
                 "link": link_by_title.get(title),
+                "pdf": pdf_by_title.get(title),
             })
 
         return {"overview": _clean(data.get("overview", ""), 300) or None, "items": items}
@@ -482,6 +484,8 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
                 lines.append(f"  💡 <b>{term}</b>: {explain}")
             if it.get("interview_note"):
                 lines.append(f"  🎯 <b>면접 연결</b>: {html.escape(it['interview_note'])}")
+            if it.get("pdf"):
+                lines.append(f'  📎 <a href="{html.escape(it["pdf"], quote=True)}">PDF 저장</a>')
             lines.append("")
     elif not os.environ.get("ANTHROPIC_API_KEY"):
         lines.append("※ ANTHROPIC_API_KEY를 등록하면 오늘의 핵심 리포트를 실제로 읽고 요약해드려요.")

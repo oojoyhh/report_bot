@@ -486,16 +486,17 @@ def build_message(hynix_reports, hynix_tier, industry_reports, industry_tier):
     elif not os.environ.get("ANTHROPIC_API_KEY"):
         lines.append("※ ANTHROPIC_API_KEY를 등록하면 오늘의 핵심 리포트를 실제로 읽고 요약해드려요.")
         lines.append("")
+    else:
+        # 요약 생성에 실패했을 때만 최소한의 안전망으로 원문 링크를 보여준다.
+        fallback_reports = (summary is None) and (hynix_reports or industry_reports)
+        if fallback_reports:
+            lines.append("<b>⚠️ 오늘은 요약 생성에 실패해서 원문 링크만 보내드려요</b>")
+            lines.append("")
+            lines += _report_links(f"<b>🔧 SK하이닉스 ({len(hynix_reports)}건)</b>", hynix_reports, hynix_tier)
+            lines.append("")
+            lines += _report_links(f"<b>💡 산업동향 ({len(industry_reports)}건)</b>", industry_reports, industry_tier)
+            lines.append("")
 
-    lines += _report_links(f"<b>🔧 SK하이닉스 리포트 전체 ({len(hynix_reports)}건)</b>", hynix_reports, hynix_tier)
-    lines.append("")
-    lines += _report_links(
-        f"<b>💡 반도체·IT서비스/AI 산업동향 전체 ({len(industry_reports)}건)</b>",
-        industry_reports,
-        industry_tier,
-    )
-
-    lines.append("")
     lines.append("출근길 화이팅! 🚇")
 
     return "\n".join(lines)
